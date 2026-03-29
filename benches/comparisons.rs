@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::ops::Bound;
 
 use bytes::Bytes;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use redb::{Database, TableDefinition};
 use tempfile::tempdir;
 
@@ -15,7 +15,6 @@ const REDB_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bench");
 fn make_key(i: usize) -> Vec<u8>   { format!("{:016}", i).into_bytes() }
 fn make_value(i: usize) -> Vec<u8> { format!("value_{:08}", i).into_bytes() }
 
-// scramble key order for random write benchmarks
 fn scramble(i: usize) -> usize {
     (i as u64).wrapping_mul(6364136223846793005) as usize
 }
@@ -30,49 +29,67 @@ fn bench_sequential_writes(c: &mut Criterion) {
 
         // bonsai
         group.bench_with_input(BenchmarkId::new("bonsai", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tempdir().unwrap();
-                let mut engine = Engine::new(dir.path()).unwrap();
-                for i in 0..n {
-                    engine.put(
-                        Bytes::from(make_key(i)),
-                        Bytes::from(make_value(i)),
-                    ).unwrap();
-                }
-                black_box(());
-            });
+            b.iter_batched(
+                || {
+                    let dir = tempdir().unwrap();
+                    let engine = Engine::new(dir.path()).unwrap();
+                    (dir, engine)
+                },
+                |(dir, mut engine)| {
+                    for i in 0..n {
+                        engine.put(Bytes::from(make_key(i)), Bytes::from(make_value(i))).unwrap();
+                    }
+                    black_box(dir)
+                },
+                BatchSize::SmallInput,
+            );
         });
 
         // sled
         group.bench_with_input(BenchmarkId::new("sled", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tempdir().unwrap();
-                let db = sled::open(dir.path()).unwrap();
-                for i in 0..n {
-                    db.insert(make_key(i), make_value(i)).unwrap();
-                }
-                black_box(());
-            });
+            b.iter_batched(
+                || {
+                    let dir = tempdir().unwrap();
+                    let db = sled::open(dir.path()).unwrap();
+                    (dir, db)
+                },
+                |(dir, db)| {
+                    for i in 0..n {
+                        db.insert(make_key(i), make_value(i)).unwrap();
+                    }
+                    black_box(dir)
+                },
+                BatchSize::SmallInput,
+            );
         });
 
         // redb
         group.bench_with_input(BenchmarkId::new("redb", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir  = tempdir().unwrap();
-                let db   = Database::create(dir.path().join("bench.redb")).unwrap();
-                let txn  = db.begin_write().unwrap();
-                {
-                    let mut table = txn.open_table(REDB_TABLE).unwrap();
-                    for i in 0..n {
-                        table.insert(make_key(i).as_slice(), make_value(i).as_slice()).unwrap();
+            b.iter_batched(
+                || {
+                    let dir = tempdir().unwrap();
+                    let db = Database::create(dir.path().join("bench.redb")).unwrap();
+                    let txn = db.begin_write().unwrap();
+                    txn.open_table(REDB_TABLE).unwrap();
+                    txn.commit().unwrap();
+                    (dir, db)
+                },
+                |(dir, db)| {
+                    let txn = db.begin_write().unwrap();
+                    {
+                        let mut table = txn.open_table(REDB_TABLE).unwrap();
+                        for i in 0..n {
+                            table.insert(make_key(i).as_slice(), make_value(i).as_slice()).unwrap();
+                        }
                     }
-                }
-                txn.commit().unwrap();
-                black_box(());
-            });
+                    txn.commit().unwrap();
+                    black_box(dir)
+                },
+                BatchSize::SmallInput,
+            );
         });
 
-        // heed (LMDB)
+        // heed (LMDB) — single env, clear between iterations
         group.bench_with_input(BenchmarkId::new("heed (LMDB)", n), &n, |b, &n| {
             let dir = tempdir().unwrap();
             let env = unsafe {
@@ -81,20 +98,28 @@ fn bench_sequential_writes(c: &mut Criterion) {
                     .open(dir.path())
                     .unwrap()
             };
-            // Create the db once outside the loop
             let mut wtxn = env.write_txn().unwrap();
             let db: heed::Database<heed::types::Bytes, heed::types::Bytes> =
                 env.create_database(&mut wtxn, None).unwrap();
             wtxn.commit().unwrap();
 
-            b.iter(|| {
-                let mut wtxn = env.write_txn().unwrap();
-                for i in 0..n {
-                    db.put(&mut wtxn, &make_key(i), &make_value(i)).unwrap();
-                }
-                wtxn.commit().unwrap();
-                black_box(());
-            });
+            b.iter_batched(
+                || {
+                    let mut wtxn = env.write_txn().unwrap();
+                    db.clear(&mut wtxn).unwrap();
+                    wtxn.commit().unwrap();
+                },
+                |_| {
+                    let mut wtxn = env.write_txn().unwrap();
+                    for i in 0..n {
+                        db.put(&mut wtxn, &make_key(i), &make_value(i)).unwrap();
+                    }
+                    wtxn.commit().unwrap();
+                    black_box(())
+                },
+                BatchSize::PerIteration,
+            );
+            let _ = &dir;
         });
     }
     group.finish();
@@ -108,50 +133,75 @@ fn bench_random_writes(c: &mut Criterion) {
     for n in [1_000usize, 10_000] {
         group.throughput(Throughput::Elements(n as u64));
 
+        // bonsai
         group.bench_with_input(BenchmarkId::new("bonsai", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tempdir().unwrap();
-                let mut engine = Engine::new(dir.path()).unwrap();
-                for i in 0..n {
-                    engine.put(
-                        Bytes::from(make_key(scramble(i))),
-                        Bytes::from(make_value(i)),
-                    ).unwrap();
-                }
-                black_box(());
-            });
-        });
-
-        group.bench_with_input(BenchmarkId::new("sled", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tempdir().unwrap();
-                let db = sled::open(dir.path()).unwrap();
-                for i in 0..n {
-                    db.insert(make_key(scramble(i)), make_value(i)).unwrap();
-                }
-                black_box(());
-            });
-        });
-
-        group.bench_with_input(BenchmarkId::new("redb", n), &n, |b, &n| {
-            b.iter(|| {
-                let dir = tempdir().unwrap();
-                let db  = Database::create(dir.path().join("bench.redb")).unwrap();
-                let txn = db.begin_write().unwrap();
-                {
-                    let mut table = txn.open_table(REDB_TABLE).unwrap();
+            b.iter_batched(
+                || {
+                    let dir = tempdir().unwrap();
+                    let engine = Engine::new(dir.path()).unwrap();
+                    (dir, engine)
+                },
+                |(dir, mut engine)| {
                     for i in 0..n {
-                        table.insert(
-                            make_key(scramble(i)).as_slice(),
-                            make_value(i).as_slice(),
+                        engine.put(
+                            Bytes::from(make_key(scramble(i))),
+                            Bytes::from(make_value(i)),
                         ).unwrap();
                     }
-                }
-                txn.commit().unwrap();
-                black_box(());
-            });
+                    black_box(dir)
+                },
+                BatchSize::SmallInput,
+            );
         });
 
+        // sled
+        group.bench_with_input(BenchmarkId::new("sled", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let dir = tempdir().unwrap();
+                    let db = sled::open(dir.path()).unwrap();
+                    (dir, db)
+                },
+                |(dir, db)| {
+                    for i in 0..n {
+                        db.insert(make_key(scramble(i)), make_value(i)).unwrap();
+                    }
+                    black_box(dir)
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // redb
+        group.bench_with_input(BenchmarkId::new("redb", n), &n, |b, &n| {
+            b.iter_batched(
+                || {
+                    let dir = tempdir().unwrap();
+                    let db = Database::create(dir.path().join("bench.redb")).unwrap();
+                    let txn = db.begin_write().unwrap();
+                    txn.open_table(REDB_TABLE).unwrap();
+                    txn.commit().unwrap();
+                    (dir, db)
+                },
+                |(dir, db)| {
+                    let txn = db.begin_write().unwrap();
+                    {
+                        let mut table = txn.open_table(REDB_TABLE).unwrap();
+                        for i in 0..n {
+                            table.insert(
+                                make_key(scramble(i)).as_slice(),
+                                make_value(i).as_slice(),
+                            ).unwrap();
+                        }
+                    }
+                    txn.commit().unwrap();
+                    black_box(dir)
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        // heed (LMDB) — single env, clear between iterations
         group.bench_with_input(BenchmarkId::new("heed (LMDB)", n), &n, |b, &n| {
             let dir = tempdir().unwrap();
             let env = unsafe {
@@ -165,14 +215,23 @@ fn bench_random_writes(c: &mut Criterion) {
                 env.create_database(&mut wtxn, None).unwrap();
             wtxn.commit().unwrap();
 
-            b.iter(|| {
-                let mut wtxn = env.write_txn().unwrap();
-                for i in 0..n {
-                    db.put(&mut wtxn, &make_key(scramble(i)), &make_value(i)).unwrap();
-                }
-                wtxn.commit().unwrap();
-                black_box(());
-            });
+            b.iter_batched(
+                || {
+                    let mut wtxn = env.write_txn().unwrap();
+                    db.clear(&mut wtxn).unwrap();
+                    wtxn.commit().unwrap();
+                },
+                |_| {
+                    let mut wtxn = env.write_txn().unwrap();
+                    for i in 0..n {
+                        db.put(&mut wtxn, &make_key(scramble(i)), &make_value(i)).unwrap();
+                    }
+                    wtxn.commit().unwrap();
+                    black_box(())
+                },
+                BatchSize::PerIteration,
+            );
+            let _ = &dir;
         });
     }
     group.finish();
@@ -182,7 +241,7 @@ fn bench_random_writes(c: &mut Criterion) {
 
 fn bench_point_reads(c: &mut Criterion) {
     let n = 10_000usize;
-    let target_key = make_key(n / 2); // middle key — worst case for scan
+    let target_key = make_key(n / 2);
 
     let mut group = c.benchmark_group("point_reads");
     group.throughput(Throughput::Elements(1));
@@ -284,11 +343,12 @@ fn bench_point_reads(c: &mut Criterion) {
             b.iter(|| {
                 let rtxn  = env.read_txn().unwrap();
                 let value = db.get(black_box(&rtxn), black_box(&key)).unwrap();
-                let result = value.map(|v| v.to_owned()); // copy out before rtxn drops
+                let result = value.map(|v| v.to_owned());
                 drop(rtxn);
                 black_box(result)
             })
         });
+        let _ = &dir;
     }
 
     group.finish();
@@ -299,7 +359,7 @@ fn bench_point_reads(c: &mut Criterion) {
 fn bench_range_scans(c: &mut Criterion) {
     let n          = 10_000usize;
     let scan_start = make_key(n / 4);
-    let scan_end   = make_key(3 * n / 4); // scan middle 50% of keys
+    let scan_end   = make_key(3 * n / 4);
 
     let mut group = c.benchmark_group("range_scans");
     group.throughput(Throughput::Elements((n / 2) as u64));
@@ -335,8 +395,7 @@ fn bench_range_scans(c: &mut Criterion) {
         let hi = scan_end.clone();
         group.bench_function("sled", |b| {
             b.iter(|| {
-                db.range(black_box(lo.clone())..=black_box(hi.clone()))
-                    .count()
+                db.range(black_box(lo.clone())..=black_box(hi.clone())).count()
             })
         });
     }
@@ -391,13 +450,12 @@ fn bench_range_scans(c: &mut Criterion) {
                     Bound::Included(lo.as_slice()),
                     Bound::Included(hi.as_slice()),
                 );
-                let count = db.range(&rtxn, &range)
-                    .unwrap()
-                    .count();
+                let count = db.range(&rtxn, &range).unwrap().count();
                 drop(rtxn);
                 black_box(count)
             })
         });
+        let _ = &dir;
     }
 
     group.finish();
