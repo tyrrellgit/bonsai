@@ -19,5 +19,17 @@ crossbeam-skiplist = "0.1"
 fastbloom = { version = "0.17.0", features = ["serde"] }
 
 [dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3"
 pretty_assertions = "1"
+sled      = "0.34"
+redb      = "2"
+heed      = "0.20"
+
+[[bench]]
+name    = "engine"
+harness = false
+
+[[bench]]
+name    = "comparisons"
+harness = false
