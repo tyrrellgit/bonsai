@@ -6,6 +6,17 @@ use tempfile::tempdir;
 
 use bonsai::engine::Engine;
 
+/*
+Benchmarks for core Engine operations, including:
+
+    - Sequential writes (to test memtable performance)
+    - Random writes (to test memtable performance under non-sequential keys)
+    - Hot reads (keys in active memtable, no disk I/O)
+    - Cold reads with hit (keys in SSTable, disk I/O required)
+    - Cold reads with miss (keys not present, bloom filter should short-circuit)
+    - Full scans (to test SSTable iteration performance)
+    - WAL recovery (to test replay performance on startup)
+*/
 
 fn sequential_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("writes");

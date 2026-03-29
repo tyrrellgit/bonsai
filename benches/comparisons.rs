@@ -10,6 +10,15 @@ use bonsai::engine::Engine;
 
 const REDB_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bench");
 
+/*
+Benchmark comparisons for bonsai against:
+    - sled (B tree)
+    - redb (B tree)
+    - heed (LMDB binding)
+    - rocksDB (LSM tree) — TODO
+*/
+
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn make_key(i: usize) -> Vec<u8>   { format!("{:016}", i).into_bytes() }
