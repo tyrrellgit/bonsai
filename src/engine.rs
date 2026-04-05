@@ -29,9 +29,9 @@ impl CompactionConfig {
 impl Default for CompactionConfig {
     fn default() -> Self {
         CompactionConfig {
-            max_l0_files: 4, // Compact when L0 has 4+ files
+            max_l0_files: 4,      // Compact when L0 has 4+ files
             level_multiplier: 10, // Each level 10x larger than previous
-            num_levels: 3, // Support up to L0-L2
+            num_levels: 3,        // Support up to L0-L2
         }
     }
 }
