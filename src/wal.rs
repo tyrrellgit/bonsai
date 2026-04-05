@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const OP_PUT:    u8 = 1;
 const OP_DELETE: u8 = 0;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WalEntry {
     Put    { key: Bytes, value: Bytes },
     Delete { key: Bytes },
