@@ -9,7 +9,7 @@ use crate::sstable::SSTable;
 use crate::merge::MergeIter;
 use crate::wal::Wal;
 
-const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4 * 1024 * 1024;
+const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4 * 1024 * 1024; // 4MB
 
 /// Configuration for leveled compaction.
 #[derive(Clone)]

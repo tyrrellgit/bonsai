@@ -60,3 +60,12 @@ We have included a simple example which can be run via:
 ```bash
 cargo run --example simple
 ```
+
+# Custom Configuration
+`bonsai` aims to keep things *small*.
+
+For example our `memtable` blocks are only `4MB` by default and our default `CompactionConfig` prioritizes a small `L0` to reduce read and space amplification.  
+
+Tweaking these is possible, and recommended, if you have larger memory/write requirements; see the `Engine` for details.
+
+> A quick win for heavy write workloads is usually bumping the `memtable_size_limit` 
