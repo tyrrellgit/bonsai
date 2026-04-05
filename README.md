@@ -18,7 +18,7 @@ Like the art form it's named after, everything unnecessary has been removed whil
 - **SSTable** — immutable sorted files with bloom filter lookups from `fastbloom`
 - **WAL** — crash recovery via write-ahead log with CRC32 checksums with `crc32fast`
 - **Merge iterator** — sorted range scans across all data sources
-- **Compaction** — *(coming soon)*
+- **Compaction** — multi-level SST compaction for improved read and space amplification
 - **MVCC** — *(coming soon)*
 
 ## Usage
