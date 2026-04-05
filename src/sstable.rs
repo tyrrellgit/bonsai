@@ -11,12 +11,12 @@ use crate::memtable::MemTable;
 
 const BLOOM_FP_RATE: f64 = 0.01;
 
-pub struct SSTableEntry {
+pub(crate) struct SSTableEntry {
     pub key:   Bytes,
     pub value: Bytes,
 }
 
-pub struct SSTable {
+pub(crate) struct SSTable {
     pub id:        usize,
     pub path:      PathBuf,
     pub first_key: Bytes,
@@ -25,7 +25,7 @@ pub struct SSTable {
     bloom:         BloomFilter,
 }
 
-pub struct SSTableIter {
+pub(crate) struct SSTableIter {
     reader:  Take<BufReader<File>>,
     upper:   Bound<Bytes>,
     pending: Option<(Bytes, Bytes)>, // first qualifying entry from lower bound scan

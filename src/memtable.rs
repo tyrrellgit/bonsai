@@ -4,7 +4,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-pub struct MemTable {
+pub(crate) struct MemTable {
     pub map:  Arc<SkipMap<Bytes, Bytes>>,
     pub id:   usize,
     size:     Arc<AtomicUsize>,
@@ -46,10 +46,6 @@ impl MemTable {
 
     pub fn entry_count(&self) -> usize {
         self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Bytes, Bytes)> + '_ {
