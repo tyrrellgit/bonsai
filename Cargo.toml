@@ -33,7 +33,3 @@ harness = false
 [[bench]]
 name    = "comparisons"
 harness = false
-
-[[bench]]
-name    = "scan"
-harness = false
