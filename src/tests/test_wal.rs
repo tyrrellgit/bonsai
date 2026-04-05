@@ -72,3 +72,21 @@ fn test_append_across_open() {
     let entries = Wal::replay(&path).unwrap();
     assert_eq!(entries.len(), 2);
 }
+
+#[test]
+fn test_replay_is_idempotent() {
+    let dir  = tempdir().unwrap();
+    let path = dir.path().join("test.wal");
+    let mut wal = Wal::new(&path).unwrap();
+    wal.put(b"key1", b"val1").unwrap();
+    wal.put(b"key2", b"val2").unwrap();
+    wal.delete(b"key1").unwrap();
+
+    // Replay twice — must produce identical results both times
+    let first  = Wal::replay(&path).unwrap();
+    let second = Wal::replay(&path).unwrap();
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(format!("{:?}", a), format!("{:?}", b));
+    }
+}
