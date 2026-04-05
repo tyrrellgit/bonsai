@@ -9,7 +9,7 @@ use crate::sstable::SSTable;
 use crate::merge::MergeIter;
 use crate::wal::Wal;
 
-const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4 * 1024 * 1024; // 4MB
+const DEFAULT_MEMTABLE_SIZE_LIMIT: usize = 4 * 1024 * 1024; // MB
 
 /// Configuration for leveled compaction.
 #[derive(Clone)]
@@ -31,7 +31,7 @@ impl Default for CompactionConfig {
         CompactionConfig {
             max_l0_files: 4, // Compact when L0 has 4+ files
             level_multiplier: 10, // Each level 10x larger than previous
-            num_levels: 7, // Support up to L0-L6
+            num_levels: 3, // Support up to L0-L2
         }
     }
 }
@@ -184,15 +184,19 @@ impl Engine {
         }
         Ok(None)
     }
-    pub fn scan(&self, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Result<MergeIter> {
+    pub fn scan(&self, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Result<impl Iterator<Item = (Bytes, Bytes)>> {
         let mut iters: Vec<Box<dyn Iterator<Item = (Bytes, Bytes)>>> = Vec::new();
 
         // Add SSTables from all levels, oldest → newest so index == priority in MergeIter
-        for level in 0..self.sstables_by_level.len() {
+        for level in (0..self.sstables_by_level.len()).rev() {
             for sst in self.sstables_by_level[level].iter() {
-                iters.push(Box::new(sst.scan(lower.clone(), upper.clone())?));
+                // Skip if SSTable's range doesn't overlap with query range
+                if self.sst_overlaps_range(sst, &lower, &upper) {
+                    iters.push(Box::new(sst.scan(lower.clone(), upper.clone())?));
+                }
             }
         }
+        // Add memtables oldest -> newest (see freeze_memtable order)
         for (imm, _) in self.imm_memtables.iter() {
             iters.push(Box::new(imm.scan(lower.clone(), upper.clone()).into_iter()));
         }
@@ -201,6 +205,11 @@ impl Engine {
         ));
 
         Ok(MergeIter::new(iters))
+    }
+
+    /// Check if an SSTable's key range overlaps with the query range.
+    fn sst_overlaps_range(&self, sst: &SSTable, lower: &Bound<Bytes>, upper: &Bound<Bytes>) -> bool {
+        range_overlaps(&sst.first_key, &sst.last_key, lower, upper)
     }
 
     // ── Freeze & Flush ────────────────────────────────────────────────────────
@@ -358,7 +367,7 @@ impl Engine {
 
     /// Get count of L0 SSTables (for testing/metrics).
     pub fn l0_count(&self) -> usize {
-        self.sstables_by_level.get(0).map_or(0, |v| v.len())
+        self.sstables_by_level.first().map_or(0, |v| v.len())
     }
 
     /// Get count of all SSTables at a given level (for testing/metrics).
@@ -382,4 +391,22 @@ fn parse_id(path: &Path) -> usize {
         .and_then(|s| s.to_str())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+fn range_overlaps(
+    first_key: &Bytes,
+    last_key:  &Bytes,
+    lower:     &Bound<Bytes>,
+    upper:     &Bound<Bytes>) -> bool {
+    let past_upper = match upper {
+        Bound::Included(u) => first_key > u,
+        Bound::Excluded(u) => first_key >= u,
+        Bound::Unbounded   => false,
+    };
+    let before_lower = match lower {
+        Bound::Included(l) => last_key < l,
+        Bound::Excluded(l) => last_key <= l,
+        Bound::Unbounded   => false,
+    };
+    !past_upper && !before_lower
 }
