@@ -64,7 +64,7 @@ cargo run --example simple
 # Custom Configuration
 `bonsai` aims to keep things *small*.
 
-For example our `memtable` blocks are only `4MB` by default and our default `CompactionConfig` prioritizes a small `L0` to reduce read and space amplification.  This makes small read/write cycles blazingly fast, but we suffer on larger insertions as the tables need to be flushed and compacted more regularly.
+For example our `memtable` objects in `L0` are only `4MB` (by default) and our default `CompactionConfig` prioritizes a small `L0` to reduce read and space amplification.  This makes small read/write cycles blazingly fast, but we suffer on larger insertions as the tables need to be flushed and compacted more regularly.
 
 Tweaking these is possible, and recommended, if you have larger memory/write requirements; see the `Engine` and `CompactionConfig` for details.
 
