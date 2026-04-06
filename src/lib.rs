@@ -5,6 +5,7 @@ pub(crate) mod memtable;
 pub(crate) mod sstable;
 pub(crate) mod compact;
 pub(crate) mod merge;
+pub(crate) mod manifest;
 pub(crate) mod wal;
 
 #[cfg(test)]

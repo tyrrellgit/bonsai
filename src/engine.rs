@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::compact::{Compactor, CompactionResult};
 use crate::compact::leveled::LeveledCompactionStrategy;
+use crate::manifest::{Manifest, ManifestRecord};
 use crate::memtable::MemTable;
 use crate::merge::MergeIter;
 use crate::sstable::SSTable;
@@ -58,6 +59,13 @@ struct FlushJob {
     sst_path: PathBuf,
 }
 
+/// Carries the completed SST and the wal_path back to the engine thread so the
+/// engine can write the manifest record before deleting the WAL.
+struct FlushResult {
+    sst:      SSTable,
+    wal_path: PathBuf,
+}
+
 
 // ── Engine ────────────────────────────────────────────────────────────────────
 
@@ -71,9 +79,10 @@ pub struct Engine {
     next_id:             usize,
     compaction_config:   CompactionConfig,
     flush_tx:            Option<Sender<FlushJob>>,
-    flush_rx:            Receiver<SSTable>,
+    flush_rx:            Receiver<FlushResult>,
     flush_thread:        Option<JoinHandle<()>>,
     compactor:           Compactor,
+    manifest:            Manifest,
 }
 
 impl Engine {
@@ -86,6 +95,8 @@ impl Engine {
     pub fn new_with_config(data_dir: impl Into<PathBuf>, config: CompactionConfig) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
+
+        let manifest = Manifest::create(&data_dir)?;
 
         let id  = 0;
         let wal = Wal::new(&data_dir.join(format!("{:08}.wal", id)))?;
@@ -106,6 +117,7 @@ impl Engine {
             flush_rx,
             flush_thread:        Some(flush_thread),
             compactor,
+            manifest,
         })
     }
 
@@ -119,17 +131,40 @@ impl Engine {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
 
-        // ── Restore SSTables ─────────────────────────────────────────────────
-        let mut sstables: Vec<SSTable> = std::fs::read_dir(&data_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "sst"))
-            .map(|e| {
-                let path = e.path();
-                let id   = parse_id(&path);
-                SSTable::open(id, path)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        sstables.sort_by_key(|s| s.id);
+        // ── Restore SSTables via manifest, or fall back to dir scan ──────────
+        let manifest_path = data_dir.join(crate::manifest::MANIFEST_FILENAME);
+
+        let (manifest, sstables_by_level) = if manifest_path.exists() {
+            // Manifest-driven open: authoritative level layout.
+            let (m, level_ids) = Manifest::open(&data_dir, config.num_levels)?;
+            let mut by_level: Vec<Vec<SSTable>> =
+                (0..config.num_levels).map(|_| Vec::new()).collect();
+            for (level, ids) in level_ids.iter().enumerate() {
+                let mut ssts: Vec<SSTable> = ids.iter()
+                    .map(|&id| SSTable::open(id, data_dir.join(format!("{:08}.sst", id))))
+                    .collect::<Result<Vec<_>>>()?;
+                ssts.sort_by_key(|s| s.id);
+                by_level[level] = ssts;
+            }
+            (m, by_level)
+        } else {
+            // Legacy: no manifest yet — scan directory, put everything in L0,
+            // then bootstrap a manifest so future opens use it.
+            let mut ssts: Vec<SSTable> = std::fs::read_dir(&data_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "sst"))
+                .map(|e| { let p = e.path(); SSTable::open(parse_id(&p), p) })
+                .collect::<Result<Vec<_>>>()?;
+            ssts.sort_by_key(|s| s.id);
+            let mut by_level: Vec<Vec<SSTable>> =
+                (0..config.num_levels).map(|_| Vec::new()).collect();
+            let mut m = Manifest::create(&data_dir)?;
+            for sst in &ssts {
+                m.append(&ManifestRecord::NewFile { level: 0, id: sst.id })?;
+            }
+            by_level[0] = ssts;
+            (m, by_level)
+        };
 
         // ── Replay WALs ──────────────────────────────────────────────────────
         let mut wal_paths: Vec<PathBuf> = std::fs::read_dir(&data_dir)?
@@ -154,21 +189,27 @@ impl Engine {
             imm_memtables.push((mem, path.clone()));
         }
 
-        // The highest-ID WAL becomes the new active memtable + WAL
+        // The highest-ID WAL becomes the new active memtable + WAL.
         let (memtable, wal) = if let Some((mem, path)) = imm_memtables.pop() {
             let wal = Wal::new(&path)?;
             (mem, wal)
         } else {
-            let id  = sstables.last().map_or(0, |s| s.id + 1);
+            // No WALs: start fresh after the highest SST id seen across all levels.
+            let max_sst_id = sstables_by_level.iter()
+                .flat_map(|lvl| lvl.iter().map(|s| s.id))
+                .max()
+                .unwrap_or(0);
+            let id  = max_sst_id + 1;
             let wal = Wal::new(&data_dir.join(format!("{:08}.wal", id)))?;
             (Arc::new(MemTable::new(id)), wal)
         };
 
-        let next_id = memtable.id + 1;
-
-        let mut sstables_by_level: Vec<Vec<SSTable>> =
-            (0..config.num_levels).map(|_| Vec::new()).collect();
-        sstables_by_level[0] = sstables;
+        // next_id must be above every SST id and the active memtable id.
+        let max_sst_id = sstables_by_level.iter()
+            .flat_map(|lvl| lvl.iter().map(|s| s.id))
+            .max()
+            .unwrap_or(0);
+        let next_id = max_sst_id.max(memtable.id) + 1;
 
         let (flush_tx, flush_rx, flush_thread) = Self::spawn_flush_worker();
         let compactor = Compactor::new(LeveledCompactionStrategy::new(config.clone()));
@@ -186,9 +227,10 @@ impl Engine {
             flush_rx,
             flush_thread:        Some(flush_thread),
             compactor,
+            manifest,
         };
 
-        // Re-dispatch flush jobs for imm memtables recovered from WALs
+        // Re-dispatch flush jobs for imm memtables recovered from WALs.
         for (mem, wal_path) in &engine.imm_memtables {
             let sst_path = engine.sst_path(mem.id);
             engine.send_flush_job(Arc::clone(mem), wal_path.clone(), sst_path);
@@ -293,15 +335,16 @@ impl Engine {
 
     // ── Background workers ────────────────────────────────────────────────────
 
-    fn spawn_flush_worker() -> (Sender<FlushJob>, Receiver<SSTable>, JoinHandle<()>) {
+    fn spawn_flush_worker() -> (Sender<FlushJob>, Receiver<FlushResult>, JoinHandle<()>) {
         let (job_tx, job_rx)   = mpsc::channel::<FlushJob>();
-        let (done_tx, done_rx) = mpsc::channel::<SSTable>();
+        let (done_tx, done_rx) = mpsc::channel::<FlushResult>();
         let handle = thread::spawn(move || {
             for job in job_rx {
                 match SSTable::from_memtable(&job.mem, &job.sst_path) {
                     Ok(sst) => {
-                        let _ = std::fs::remove_file(&job.wal_path);
-                        if done_tx.send(sst).is_err() { break; }
+                        if done_tx.send(FlushResult { sst, wal_path: job.wal_path }).is_err() {
+                            break;
+                        }
                     }
                     Err(e) => eprintln!("[flush worker] {e}"),
                 }
@@ -317,7 +360,9 @@ impl Engine {
     }
 
     pub(crate) fn drain_completed_flushes(&mut self) -> Result<()> {
-        while let Ok(sst) = self.flush_rx.try_recv() {
+        while let Ok(FlushResult { sst, wal_path }) = self.flush_rx.try_recv() {
+            self.manifest.append(&ManifestRecord::NewFile { level: 0, id: sst.id })?;
+            let _ = std::fs::remove_file(&wal_path);
             self.imm_memtables.remove(0);
             let pos = self.sstables_by_level[0].partition_point(|s| s.id < sst.id);
             self.sstables_by_level[0].insert(pos, sst);
@@ -328,11 +373,12 @@ impl Engine {
 
     pub(crate) fn drain_completed_compactions(&mut self) -> Result<()> {
         while let Some(result) = self.compactor.try_recv() {
-            self.apply_compaction_result(result);
+            self.apply_compaction_result(result)?;
             self.trigger_compaction()?;
         }
         Ok(())
     }
+
 
     // ── Compaction ────────────────────────────────────────────────────────────
 
@@ -345,25 +391,36 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_compaction_result(&mut self, result: CompactionResult) {
+    fn apply_compaction_result(&mut self, result: CompactionResult) -> Result<()> {
         let upper_idx = result.task.upper_level.unwrap_or(0);
         let lower_idx = result.task.lower_level;
 
         let upper_ids: HashSet<usize> = result.task.upper_sst_ids.iter().copied().collect();
         let lower_ids: HashSet<usize> = result.task.lower_sst_ids.iter().copied().collect();
 
-        let mut to_delete: Vec<PathBuf> = self.sstables_by_level[upper_idx]
+        let to_delete: Vec<PathBuf> = self.sstables_by_level[upper_idx]
             .iter()
             .filter(|s| upper_ids.contains(&s.id))
             .map(|s| s.path.clone())
+            .chain(
+                self.sstables_by_level[lower_idx]
+                    .iter()
+                    .filter(|s| lower_ids.contains(&s.id))
+                    .map(|s| s.path.clone()),
+            )
             .collect();
-        to_delete.extend(
-            self.sstables_by_level[lower_idx]
-                .iter()
-                .filter(|s| lower_ids.contains(&s.id))
-                .map(|s| s.path.clone()),
-        );
 
+        // Build the manifest edit and fsync BEFORE deleting any file.
+        let added: Vec<(usize, usize)> = result.outputs.iter()
+            .map(|s| (lower_idx, s.id))
+            .collect();
+        let removed: Vec<(usize, usize)> = result.task.upper_sst_ids.iter()
+            .map(|&id| (upper_idx, id))
+            .chain(result.task.lower_sst_ids.iter().map(|&id| (lower_idx, id)))
+            .collect();
+        self.manifest.append(&ManifestRecord::CompactionEdit { added, removed })?;
+
+        // Now safe to update in-memory state and delete the old files.
         self.sstables_by_level[upper_idx].retain(|s| !upper_ids.contains(&s.id));
         self.sstables_by_level[lower_idx].retain(|s| !lower_ids.contains(&s.id));
 
@@ -374,6 +431,7 @@ impl Engine {
         }
 
         for path in to_delete { let _ = std::fs::remove_file(path); }
+        Ok(())
     }
 
 
