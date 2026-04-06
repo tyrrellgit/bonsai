@@ -1,22 +1,20 @@
 use bytes::Bytes;
 use std::ops::Bound;
 use tempfile::tempdir;
-use crate::engine::{ Engine, CompactionConfig };
+use crate::engine::{ Engine, CompactionConfig, DEFAULT_MEMTABLE_SIZE_LIMIT };
 
 // helper method
 fn b(s: &str) -> Bytes { Bytes::from(s.to_owned()) }
 
 fn build_test_engine(dir: &tempfile::TempDir) -> Engine {
 
-    let max_l0_files = 4; // Trigger compaction after 4 L0 files
-    let level_multiplier = 10;
-    let num_levels = 2;
-
     let compaction_config = CompactionConfig {
-        max_l0_files,
-        level_multiplier,
-        num_levels,
-    };
+            memtable_size_limit: DEFAULT_MEMTABLE_SIZE_LIMIT,
+            max_l0_files:        4,
+            max_l0_size:         200 * 1024 * 1024,
+            level_multiplier:    10,
+            num_levels:          7,
+        };
     Engine::new_with_config(dir.path(), compaction_config).unwrap()
 }
 
@@ -30,14 +28,28 @@ fn test_compaction_triggered_on_l0_overflow() {
     for i in 0..4 {
         engine.put(b(&format!("key{}", i)), b(&format!("value{}", i))).unwrap();
         engine.freeze_memtable().unwrap();
-        engine.flush_oldest_imm().unwrap();
     }
+
+    std::thread::sleep(std::time::Duration::from_millis(100)); // wait for flushes
+    engine.drain_completed_flushes().unwrap();                 // install into L0, triggers compaction dispatch
+
+    std::thread::sleep(std::time::Duration::from_millis(100)); // wait for compaction
+    engine.drain_completed_compactions().unwrap(); 
 
     // L0 should be empty after compaction
     assert_eq!(engine.l0_count(), 0, "L0 should be compacted");
-    
-    // L1 should have the merged sstables
-    assert_eq!(engine.level_count(1), 1, "L1 should have merged sstable");
+
+    // Data should have been compacted into some level above L0
+    let total_above_l0: usize = (1..engine.num_levels())
+        .map(|l| engine.level_count(l))
+        .sum();
+    assert!(total_above_l0 >= 1, "At least one SST should exist above L0 after compaction");
+
+    // Data must still be readable
+    for i in 0..4 {
+        let key = Bytes::from(format!("key{}", i));
+        assert!(engine.get(&key).unwrap().is_some(), "key{} missing after compaction", i);
+    }
 }
 
 #[test]
