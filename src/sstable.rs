@@ -18,12 +18,26 @@ const FOOTER_LEN_BYTES: u64 = std::mem::size_of::<u32>() as u64;
 // so open() can seek straight to an index without scanning.
 
 #[derive(Serialize, Deserialize)]
-struct SSTFooter {
-    data_len:  u64,
-    index:     Vec<(Vec<u8>, u64)>, // sparse: (key, byte_offset_of_entry)
-    bloom:     BloomFilter,
-    first_key: Vec<u8>,
-    last_key:  Vec<u8>,
+pub(crate) struct SSTFooter {
+    pub id:        usize,
+    pub data_len:  u64,
+    pub index:     Vec<(Vec<u8>, u64)>, // sparse: (key, byte_offset_of_entry)
+    pub bloom:     BloomFilter,
+    pub first_key: Vec<u8>,
+    pub last_key:  Vec<u8>,
+}
+
+impl SSTFooter {
+    pub fn from_table(table: &SSTable) -> Self {
+        SSTFooter {
+            id: table.id,
+            data_len: table.data_len,
+            index: table.index.iter().map(|(k, o)| (k.to_vec(), *o)).collect(),
+            bloom: table.bloom.clone(),
+            first_key: table.first_key.to_vec(),
+            last_key: table.last_key.to_vec(),
+        }
+    }
 }
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -38,7 +52,7 @@ pub(crate) struct SSTable {
     pub path:      PathBuf,
     pub first_key: Bytes,
     pub last_key:  Bytes,
-    data_len:      u64,
+    pub data_len:  u64,
     index:         Vec<(Bytes, u64)>, // in-memory sparse index
     bloom:         BloomFilter,
 }
@@ -80,40 +94,41 @@ impl Iterator for SSTableIter {
 // ── SSTable ───────────────────────────────────────────────────────────────────
 
 impl SSTable {
-    /// Write a new SSTable from a memtable
-    pub fn from_memtable(mem: &MemTable, path: &Path) -> Result<Self> {
+
+    /// Write an SSTable streaming directly from any iterator.
+    pub fn from_iter(
+        id:        usize,
+        path:      &Path,
+        iter:      impl Iterator<Item = (Bytes, Bytes)>,
+        size_hint: usize,
+    ) -> Result<Self> {
         let file = OpenOptions::new()
             .write(true).create(true).truncate(true).open(path)?;
         let mut writer = BufWriter::new(file);
 
-        let mut bloom = BloomFilter::with_false_pos(BLOOM_FP_RATE)
-            .expected_items(mem.entry_count());
-
-        let mut first_key  = Vec::new();
-        let mut last_key   = Vec::new();
-        let mut data_len   = 0u64;
+        let mut bloom     = BloomFilter::with_false_pos(BLOOM_FP_RATE)
+            .expected_items(size_hint.max(1));
+        let mut first_key = Vec::new();
+        let mut last_key  = Vec::new();
+        let mut data_len  = 0u64;
         let mut raw_index: Vec<(Vec<u8>, u64)> = Vec::new();
 
-        for (count, (key, value)) in mem.iter().enumerate() {
+        for (count, (key, value)) in iter.enumerate() {
             if count == 0 { first_key = key.to_vec(); }
             last_key = key.to_vec();
-
-            // Sparse index: record offset before every INDEX_STRIDE-th entry
-            if count % INDEX_STRIDE == 0 {
-                raw_index.push((key.to_vec(), data_len));
-            }
-
+            if count.is_multiple_of(INDEX_STRIDE) { raw_index.push((key.to_vec(), data_len)); }
             bloom.insert(key.as_ref());
             data_len += write_entry(&mut writer, &key, &value)?;
         }
 
-        let footer = SSTFooter {
+        let footer = SSTFooter { 
+            id, 
             data_len,
-            index: raw_index,
-            bloom,
-            first_key: first_key.clone(),
-            last_key:  last_key.clone(),
-        };
+            index: raw_index, 
+            bloom, 
+            first_key: first_key.clone(), 
+            last_key: last_key.clone() };
+
         let footer_bytes = postcard::to_allocvec(&footer)?;
         writer.write_all(&footer_bytes)?;
         writer.write_all(&(footer_bytes.len() as u32).to_le_bytes())?;
@@ -124,7 +139,7 @@ impl SSTable {
             .collect();
 
         Ok(SSTable {
-            id: mem.id,
+            id,
             path: path.to_owned(),
             first_key: Bytes::from(first_key),
             last_key:  Bytes::from(last_key),
@@ -132,6 +147,11 @@ impl SSTable {
             index,
             bloom: footer.bloom,
         })
+    }
+
+    /// Delegates to from_iter — no duplication of write logic.
+    pub fn from_memtable(mem: &MemTable, path: &Path) -> Result<Self> {
+        Self::from_iter(mem.id, path, mem.iter(), mem.entry_count())
     }
 
     /// Open an existing SSTable
