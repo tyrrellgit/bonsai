@@ -16,7 +16,7 @@ Like the art form it's named after, everything unnecessary has been removed whil
 
 - **MemTable** — lock-free sorted write buffer backed by a `crossbeam` skip list
 - **SSTable** — immutable sorted files with bloom filter lookups from `fastbloom`
-- **WAL** — crash recovery via write-ahead log with CRC32 checksums with `crc32fast`
+- **WAL / Manifest** — crash recovery via write-ahead logs and manifest files with CRC32 checksums from `crc32fast`
 - **Merge iterator** — sorted range scans across all data sources
 - **Compaction** — multi-level SST compaction for improved read and space amplification
 - **MVCC** — *(coming soon)*
